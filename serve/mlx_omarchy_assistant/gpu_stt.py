@@ -17,9 +17,11 @@ threshold in ACCEPTANCE_THRESHOLDS as passed.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import importlib.metadata
 import json
+import math
 import os
 import signal
 import struct
@@ -68,36 +70,117 @@ def model_dir(home: Path) -> Path:
     return Path(home) / "voice" / GPU_STT_MODEL["id"]
 
 
+_verified_lock = threading.Lock()
+# Maps (dir, name, pinned_bytes, pinned_sha256) -> (stat_identity, verified_ok).
+# Caches both verified hits and same-size digest mismatches; never caches OSError.
+_verified_identities: dict[tuple[str, str, int, str], tuple[tuple, bool]] = {}
+
+
+def _cache_key(directory: Path, entry: dict) -> tuple[str, str, int, str]:
+    return (str(directory), entry["name"], entry["bytes"], entry["sha256"])
+
+
 def _file_status(directory: Path) -> tuple[bool, list[str]]:
-    """(all present with pinned sizes, names missing or wrong-sized)."""
-    bad = [e["name"] for e in GPU_STT_MODEL["files"]
-           if not (directory / e["name"]).is_file()
-           or (directory / e["name"]).stat().st_size != e["bytes"]]
+    """(all present as readable regular files with pinned sizes, names missing or wrong-sized)."""
+    from .synthesis import _open_regular
+
+    bad: list[str] = []
+    for entry in GPU_STT_MODEL["files"]:
+        try:
+            fh, st = _open_regular(directory / entry["name"])
+        except OSError:
+            bad.append(entry["name"])
+            continue
+        with fh:
+            if st.st_size != entry["bytes"]:
+                bad.append(entry["name"])
     return not bad, bad
 
 
-@functools.cache
-def _verified(directory: Path, identities: tuple) -> bool:
-    """sha256 of every pinned file; cached per (path, size/mtime/ctime/inode)."""
-    from .synthesis import _sha256_file
-    return all(_sha256_file(directory / e["name"]) == e["sha256"]
-               for e in GPU_STT_MODEL["files"])
+def _verified(directory: Path) -> bool:
+    """Verify every pinned file via non-blocking regular-file opens.
+
+    Checks presence and pinned size for all files before hashing any file so
+    a missing or wrong-sized trailing file never triggers hashing multi-GB
+    weights. Caches verified hits and same-size digest mismatches in memory
+    by (dir, name, size, sha256) and stat identity; transient OSErrors are
+    never cached.
+    """
+    from .synthesis import _identity, _open_regular, _verify_pinned
+
+    entries: list[tuple[dict, tuple[str, str, int, str], tuple]] = []
+    for entry in GPU_STT_MODEL["files"]:
+        try:
+            fh, st = _open_regular(directory / entry["name"])
+        except OSError:
+            return False
+        with fh:
+            if st.st_size != entry["bytes"]:
+                return False
+            ident = _identity(st)
+        entries.append((entry, _cache_key(directory, entry), ident))
+
+    for entry, key, pre_ident in sorted(entries, key=lambda item: item[0]["bytes"]):
+        with _verified_lock:
+            cached = _verified_identities.get(key)
+        if cached is not None and cached[0] == pre_ident:
+            if not cached[1]:
+                return False
+            continue
+        path = directory / entry["name"]
+        try:
+            ident, actual = _verify_pinned(path, entry)
+        except OSError:
+            return False
+        if ident is not None:
+            with _verified_lock:
+                _verified_identities[key] = (ident, True)
+            continue
+        if actual is not None:
+            # Record same-size digest mismatch only when the file identity
+            # did not change across the hash.
+            try:
+                fh, st = _open_regular(path)
+                with fh:
+                    post_ident = _identity(st)
+            except OSError:
+                post_ident = None
+            if post_ident == pre_ident:
+                with _verified_lock:
+                    _verified_identities[key] = (pre_ident, False)
+        return False
+    return True
+
+
+def _clear_verified_cache() -> None:
+    with _verified_lock:
+        _verified_identities.clear()
+
+
+_verified.cache_clear = _clear_verified_cache  # type: ignore[attr-defined]
 
 
 def model_verified(home: Path) -> bool:
-    directory = model_dir(home)
-    present, _ = _file_status(directory)
-    if not present:
-        return False
-    identities = tuple(
-        (s.st_size, s.st_mtime_ns, s.st_ctime_ns, s.st_ino)
-        for s in ((directory / e["name"]).stat() for e in GPU_STT_MODEL["files"]))
-    return _verified(directory, identities)
+    return _verified(model_dir(home))
 
 
 def prepare(home: Path, approve_download: bool, *, fetch=None) -> dict:
-    """Download the pinned model with explicit approval; verify every file."""
-    from .synthesis import _URL_TEMPLATE, _default_fetch, _sha256_file
+    """Download the pinned model with explicit approval; verify every file.
+
+    ``fetch(url, path)`` replaces the network for tests; the default download
+    is capped at each file's pinned size. Concurrent prepares serialize on
+    ``voice/.<model>.lock``; defending against a hostile co-writer who already
+    has write permission on ``home`` is out of scope.
+    """
+    from .synthesis import (
+        _URL_TEMPLATE,
+        _default_fetch,
+        _error_reason,
+        _identity,
+        _open_regular,
+        _pack_lock,
+        _verify_pinned,
+    )
 
     directory = model_dir(home)
     if model_verified(home):
@@ -108,27 +191,105 @@ def prepare(home: Path, approve_download: bool, *, fetch=None) -> dict:
                            f"approval ({GPU_STT_MODEL['weights_bytes']} bytes, "
                            f"{GPU_STT_MODEL['license']} license, "
                            f"{GPU_STT_MODEL['repo']} revision {GPU_STT_MODEL['revision']})")}
-    directory.mkdir(parents=True, exist_ok=True)
-    for entry in sorted(GPU_STT_MODEL["files"], key=lambda e: e["bytes"]):
-        dest = directory / entry["name"]
-        if dest.is_file() and dest.stat().st_size == entry["bytes"] \
-                and _sha256_file(dest) == entry["sha256"]:
-            continue
-        tmp = dest.with_name(dest.name + ".part")
-        try:
-            (fetch or _default_fetch)(_URL_TEMPLATE.format(
-                repo=GPU_STT_MODEL["repo"], revision=GPU_STT_MODEL["revision"],
-                name=entry["name"]), tmp)
-            actual = _sha256_file(tmp)
-            if actual != entry["sha256"]:
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        with _pack_lock(directory):
+            for entry in sorted(GPU_STT_MODEL["files"], key=lambda e: e["bytes"]):
+                dest = directory / entry["name"]
+                key = _cache_key(directory, entry)
+                with _verified_lock:
+                    cached_entry = _verified_identities.get(key)
+                skip_verify = False
+                if cached_entry is not None and not cached_entry[1]:
+                    # Known same-size digest mismatch: skip re-hashing if the
+                    # on-disk file still has that exact identity.
+                    try:
+                        fh, st = _open_regular(dest)
+                        with fh:
+                            current_ident = (
+                                _identity(st)
+                                if st.st_size == entry["bytes"]
+                                else None
+                            )
+                    except OSError:
+                        current_ident = None
+                    skip_verify = (
+                        current_ident is not None
+                        and current_ident == cached_entry[0]
+                    )
+                if not skip_verify:
+                    cached_ok = (
+                        cached_entry[0]
+                        if cached_entry is not None and cached_entry[1]
+                        else None
+                    )
+                    try:
+                        ident, _actual = _verify_pinned(
+                            dest, entry, cached=cached_ok,
+                        )
+                    except OSError:
+                        ident = None
+                    if ident is not None:
+                        if cached_ok != ident:
+                            with _verified_lock:
+                                _verified_identities[key] = (ident, True)
+                        continue
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                # Fixed staging path under the pack lock: one prepare owns it
+                # at a time, and any leftover file or planted symlink is
+                # removed unfollowed before fetching.
+                tmp = dest.with_name(dest.name + ".part")
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(tmp)
+                url = _URL_TEMPLATE.format(
+                    repo=GPU_STT_MODEL["repo"],
+                    revision=GPU_STT_MODEL["revision"],
+                    name=entry["name"],
+                )
+                try:
+                    if fetch is None:
+                        _default_fetch(url, tmp, max_bytes=entry["bytes"])
+                    else:
+                        fetch(url, tmp)
+                    try:
+                        ident, actual = _verify_pinned(tmp, entry)
+                    except OSError as exc:
+                        raise RecognitionUnavailable(
+                            f"speech model file {entry['name']} failed "
+                            f"verification: {_error_reason(exc)}"
+                        ) from exc
+                    if ident is None:
+                        got = actual or "a file of the wrong size"
+                        raise RecognitionUnavailable(
+                            f"speech model file {entry['name']}: sha256 mismatch "
+                            f"(expected {entry['sha256']}, got {got})"
+                        )
+                    os.replace(tmp, dest)
+                    try:
+                        fh, st = _open_regular(dest)
+                        with fh:
+                            # synthesis._identity tuple is (size, mtime_ns, ctime_ns, ino);
+                            # rename(2) can bump ctime_ns while preserving size, mtime, and inode.
+                            if (st.st_size == ident[0]
+                                    and st.st_mtime_ns == ident[1]
+                                    and st.st_ino == ident[3]):
+                                with _verified_lock:
+                                    _verified_identities[key] = (_identity(st), True)
+                    except OSError:
+                        pass
+                finally:
+                    with contextlib.suppress(OSError):
+                        tmp.unlink(missing_ok=True)
+            if not model_verified(home):
                 raise RecognitionUnavailable(
-                    f"speech model file {entry['name']}: sha256 mismatch "
-                    f"(expected {entry['sha256']}, got {actual})")
-            os.replace(tmp, dest)
-        finally:
-            tmp.unlink(missing_ok=True)
-    if not model_verified(home):
-        raise RecognitionUnavailable("speech recognition model failed verification")
+                    "speech recognition model failed verification"
+                )
+    except RecognitionUnavailable:
+        raise
+    except Exception as exc:
+        raise RecognitionUnavailable(
+            f"speech recognition model download failed: {exc}"
+        ) from exc
     return {"downloaded": True, "verified": True, "path": str(directory)}
 
 
@@ -233,15 +394,87 @@ def _runtime_identity(home: Path) -> dict:
             "model_sha256": weights["sha256"] if model_verified(home) else None}
 
 
-def read_acceptance_receipt(home: Path) -> dict | None:
-    """The receipt, only while it names THIS runtime's backend and model."""
+def _is_finite_number(val) -> bool:
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        return False
     try:
-        receipt = json.loads(_receipt_path(home).read_text())
-    except (OSError, ValueError):
+        return math.isfinite(val)
+    except OverflowError:
+        return False
+
+
+def _reject_non_finite_floats(value) -> None:
+    """Reject NaN/Infinity anywhere in a receipt iteratively so server JSON
+    encoders (allow_nan=False) cannot fail on forwarded receipt fields."""
+    stack = [value]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, float):
+            if not math.isfinite(node):
+                raise ValueError(f"acceptance refused: non-finite float {node!r}")
+        elif isinstance(node, dict):
+            stack.extend(node.values())
+        elif isinstance(node, (list, tuple)):
+            stack.extend(node)
+
+
+def _validate_acceptance_metrics(*, wer_by_subset, empty_rate_by_subset,
+                                 latency_ms, cpu_tensor_events) -> None:
+    if (not isinstance(cpu_tensor_events, int)
+            or isinstance(cpu_tensor_events, bool)
+            or cpu_tensor_events != 0):
+        raise ValueError(f"acceptance refused: cpu_tensor_events={cpu_tensor_events}")
+    if (not isinstance(wer_by_subset, dict)
+            or not isinstance(empty_rate_by_subset, dict)
+            or not isinstance(latency_ms, dict)):
+        raise ValueError("acceptance refused: metric sections must be dicts")
+    failures = []
+    for subset, limit in ACCEPTANCE_THRESHOLDS["wer"].items():
+        value = wer_by_subset.get(subset)
+        if not _is_finite_number(value) or value < 0 or value > limit:
+            failures.append(f"{subset} WER {value} not in [0, {limit}]")
+    for subset, floor in ACCEPTANCE_THRESHOLDS["empty_rate_min"].items():
+        value = empty_rate_by_subset.get(subset)
+        if not _is_finite_number(value) or value < floor or value > 1.0:
+            failures.append(f"{subset} empty rate {value} not in [{floor}, 1.0]")
+    p95 = latency_ms.get("p95")
+    p95_max = ACCEPTANCE_THRESHOLDS["latency_p95_ms_max"]
+    p95_ok = _is_finite_number(p95) and 0 <= p95 <= p95_max
+    if not p95_ok:
+        failures.append(f"latency p95 {p95} ms not in [0, {p95_max}]")
+    if "p50" in latency_ms:
+        p50 = latency_ms["p50"]
+        if not _is_finite_number(p50) or p50 < 0:
+            failures.append(f"latency p50 {p50} ms is not a finite nonnegative number")
+        elif p95_ok and p50 > p95:
+            failures.append(f"latency p50 {p50} ms > p95 {p95} ms")
+    if failures:
+        raise ValueError("acceptance refused: " + "; ".join(failures))
+
+
+def read_acceptance_receipt(home: Path) -> dict | None:
+    """The receipt, only while it names THIS runtime's backend and model
+    and satisfies every frozen acceptance threshold."""
+    from .synthesis import _read_state_json
+
+    try:
+        receipt = _read_state_json(_receipt_path(home))
+    except (OSError, ValueError, RecursionError):
+        return None
+    if not isinstance(receipt, dict):
+        return None
+    try:
+        _reject_non_finite_floats(receipt)
+        _validate_acceptance_metrics(
+            wer_by_subset=receipt.get("wer_by_subset"),
+            empty_rate_by_subset=receipt.get("empty_rate_by_subset"),
+            latency_ms=receipt.get("latency_ms"),
+            cpu_tensor_events=receipt.get("cpu_tensor_events"),
+        )
+    except ValueError:
         return None
     identity = _runtime_identity(home)
-    if (not isinstance(receipt, dict)
-            or identity["mlx_backend"] is None
+    if (identity["mlx_backend"] is None
             or identity["model_sha256"] is None
             or receipt.get("mlx_backend") != identity["mlx_backend"]
             or receipt.get("model_sha256") != identity["model_sha256"]):
@@ -257,24 +490,19 @@ def write_acceptance_receipt(home: Path, *, wer_by_subset: dict,
 
     Refuses unless every frozen threshold in ACCEPTANCE_THRESHOLDS passes
     and the CPU tensor event count is zero. The backend identity and model
-    hash are computed here, never taken from the caller.
+    hash are computed here, never taken from the caller. Stages through a
+    unique sibling temp file (0600) and atomically replaces the receipt;
+    defending against a hostile co-writer who already has write permission on
+    ``home`` is out of scope.
     """
-    if cpu_tensor_events != 0:
-        raise ValueError(f"acceptance refused: cpu_tensor_events={cpu_tensor_events}")
-    failures = []
-    for subset, limit in ACCEPTANCE_THRESHOLDS["wer"].items():
-        value = wer_by_subset.get(subset)
-        if value is None or value > limit:
-            failures.append(f"{subset} WER {value} > {limit}")
-    for subset, floor in ACCEPTANCE_THRESHOLDS["empty_rate_min"].items():
-        value = empty_rate_by_subset.get(subset)
-        if value is None or value < floor:
-            failures.append(f"{subset} empty rate {value} < {floor}")
-    p95 = latency_ms.get("p95")
-    if p95 is None or p95 > ACCEPTANCE_THRESHOLDS["latency_p95_ms_max"]:
-        failures.append(f"latency p95 {p95} ms > {ACCEPTANCE_THRESHOLDS['latency_p95_ms_max']}")
-    if failures:
-        raise ValueError("acceptance refused: " + "; ".join(failures))
+    from .synthesis import _atomic_write_bytes, _check_state_depth, _check_state_size
+
+    _validate_acceptance_metrics(
+        wer_by_subset=wer_by_subset,
+        empty_rate_by_subset=empty_rate_by_subset,
+        latency_ms=latency_ms,
+        cpu_tensor_events=cpu_tensor_events,
+    )
     identity = _runtime_identity(home)
     if identity["mlx_backend"] is None or identity["model_sha256"] is None:
         raise ValueError("acceptance refused: runtime identity unverified "
@@ -292,12 +520,15 @@ def write_acceptance_receipt(home: Path, *, wer_by_subset: dict,
         "cpu_tensor_events": cpu_tensor_events,
         "receipt_source": receipt_source,
     }
+    _check_state_depth(receipt)
+    _reject_non_finite_floats(receipt)
+    payload = json.dumps(
+        receipt, indent=2, sort_keys=True, allow_nan=False,
+    ).encode("utf-8")
+    _check_state_size(len(payload))
     path = _receipt_path(home)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(receipt, indent=2, sort_keys=True))
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
+    _atomic_write_bytes(path, payload)
     return receipt
 
 
